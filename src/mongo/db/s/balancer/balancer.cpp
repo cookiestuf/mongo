@@ -368,7 +368,8 @@ void Balancer::_mainThread() {
 
                 OCCASIONALLY warnOnMultiVersion(
                     uassertStatusOK(_clusterStats->getStats(opCtx.get())));
-
+                // Perform any necessary chunk splits before running the balancing algorithm so
+                // that it sees the final view of the chunks before performing balancing
                 Status status = _enforceTagRanges(opCtx.get());
                 if (!status.isOK()) {
                     warning() << "Failed to enforce tag ranges" << causedBy(status);

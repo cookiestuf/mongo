@@ -1,30 +1,30 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+*    Copyright (C) 2018 MongoDB Inc.
+*
+*    This program is free software: you can redistribute it and/or  modify
+*    it under the terms of the GNU Affero General Public License, version 3,
+*    as published by the Free Software Foundation.
+*
+*    This program is distributed in the hope that it will be useful,
+*    but WITHOUT ANY WARRANTY; without even the implied warranty of
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*    GNU Affero General Public License for more details.
+*
+*    You should have received a copy of the GNU Affero General Public License
+*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
+*/
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
@@ -46,11 +46,16 @@ using std::string;
 using std::vector;
 
 namespace {
-
-// This value indicates the minimum deviation shard's number of chunks need to have from the
-// optimal average across all shards for a zone for a rebalancing migration to be initiated.
-const size_t kDefaultImbalanceThreshold = 1;
-
+const size_t _maxMigrationsPerShard = 1;
+bool _isShardBelowMaxMigrations(const std::map<ShardId, size_t>& numMigrationsMap,
+                                const ShardId& shardId) {
+    if (numMigrationsMap.count(shardId)) {
+        size_t numMigrations = numMigrationsMap.find(shardId)->second;
+        if (numMigrations >= _maxMigrationsPerShard)
+            return false;
+    }
+    return true;
+}
 }  // namespace
 
 DistributionStatus::DistributionStatus(NamespaceString nss, ShardToChunksMap shardToChunksMap)
@@ -58,21 +63,31 @@ DistributionStatus::DistributionStatus(NamespaceString nss, ShardToChunksMap sha
       _shardChunks(std::move(shardToChunksMap)),
       _zoneRanges(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<ZoneRange>()) {}
 
-size_t DistributionStatus::totalChunks() const {
+size_t DistributionStatus::totalChunksNotMaxedOut(const ShardStatisticsVector& shardStats) const {
     size_t total = 0;
+    std::string tag;
 
-    for (const auto& shardChunk : _shardChunks) {
-        total += shardChunk.second.size();
+    for (const auto& stat : shardStats) {
+        Status status = BalancerPolicy::isShardSuitableReceiver(stat, tag);
+        if (!status.isOK())
+            continue;
+
+        total += _shardChunks.at(stat.shardId).size();
     }
 
     return total;
 }
 
-size_t DistributionStatus::totalChunksWithTag(const std::string& tag) const {
+size_t DistributionStatus::totalChunksWithTagNotMaxedOut(const ShardStatisticsVector& shardStats,
+                                                         const std::string& tag) const {
     size_t total = 0;
 
-    for (const auto& shardChunk : _shardChunks) {
-        total += numberOfChunksInShardWithTag(shardChunk.first, tag);
+    for (const auto& stat : shardStats) {
+        auto status = BalancerPolicy::isShardSuitableReceiver(stat, tag);
+        if (!status.isOK())
+            continue;
+
+        total += numberOfChunksInShardWithTag(stat.shardId, tag);
     }
 
     return total;
@@ -84,7 +99,7 @@ size_t DistributionStatus::numberOfChunksInShard(const ShardId& shardId) const {
 }
 
 size_t DistributionStatus::numberOfChunksInShardWithTag(const ShardId& shardId,
-                                                        const string& tag) const {
+                                                        const std::string& tag) const {
     const auto& shardChunks = getChunks(shardId);
 
     size_t total = 0;
@@ -97,14 +112,41 @@ size_t DistributionStatus::numberOfChunksInShardWithTag(const ShardId& shardId,
 
     return total;
 }
+vector<ChunkType>& DistributionStatus::getChunks(const ShardId& shardId) {
+    ShardToChunksMap::iterator i = _shardChunks.find(shardId);
+    invariant(i != _shardChunks.end());
 
+    return i->second;
+}
 const vector<ChunkType>& DistributionStatus::getChunks(const ShardId& shardId) const {
     ShardToChunksMap::const_iterator i = _shardChunks.find(shardId);
     invariant(i != _shardChunks.end());
 
     return i->second;
 }
+vector<ChunkType>::iterator DistributionStatus::moveChunkInDistributionAndUpdateMigrationsPerShard(
+    const ShardId& donorShard,
+    const ShardId& receiverShard,
+    const std::vector<ChunkType>::iterator chunkIter,
+    MigrateCandidatesSelection* migrateCandidatesSelection) {
 
+    // Update migrationsPerShard.
+    auto numMigrationsIter = migrateCandidatesSelection->migrationsPerShard.find(donorShard);
+    if (numMigrationsIter == migrateCandidatesSelection->migrationsPerShard.end()) {
+        migrateCandidatesSelection->migrationsPerShard.insert(std::make_pair(donorShard, 1));
+    } else {
+        numMigrationsIter->second = (numMigrationsIter->second + 1);
+    }
+    numMigrationsIter = migrateCandidatesSelection->migrationsPerShard.find(receiverShard);
+    if (numMigrationsIter == migrateCandidatesSelection->migrationsPerShard.end()) {
+        migrateCandidatesSelection->migrationsPerShard.insert(std::make_pair(receiverShard, 1));
+    } else {
+        numMigrationsIter->second = (numMigrationsIter->second + 1);
+    }
+    // Move chunk in distribution.
+    _shardChunks.find(receiverShard)->second.push_back(*chunkIter);
+    return _shardChunks.find(donorShard)->second.erase(chunkIter);
+}
 Status DistributionStatus::addRangeToZone(const ZoneRange& range) {
     const auto minIntersect = _zoneRanges.upper_bound(range.min);
     const auto maxIntersect = _zoneRanges.upper_bound(range.max);
@@ -217,7 +259,7 @@ string DistributionStatus::toString() const {
 }
 
 Status BalancerPolicy::isShardSuitableReceiver(const ClusterStatistics::ShardStatistics& stat,
-                                               const string& chunkTag) {
+                                               const std::string& chunkTag) {
     if (stat.isSizeMaxed()) {
         return {ErrorCodes::IllegalOperation,
                 str::stream() << stat.shardId << " has reached its maximum storage size."};
@@ -236,47 +278,54 @@ Status BalancerPolicy::isShardSuitableReceiver(const ClusterStatistics::ShardSta
     return Status::OK();
 }
 
-ShardId BalancerPolicy::_getLeastLoadedReceiverShard(const ShardStatisticsVector& shardStats,
-                                                     const DistributionStatus& distribution,
-                                                     const string& tag,
-                                                     const set<ShardId>& excludedShards) {
+std::pair<ShardId, size_t> BalancerPolicy::_getLeastLoadedReceiverShard(
+    const ShardStatisticsVector& shardStats,
+    const DistributionStatus& distribution,
+    const std::string& tag,
+    MigrateCandidatesSelection* migrateCandidatesSelection) {
     ShardId best;
     unsigned minChunks = numeric_limits<unsigned>::max();
 
     for (const auto& stat : shardStats) {
-        if (excludedShards.count(stat.shardId))
+        if (migrateCandidatesSelection->usedDonorShards.count(stat.shardId) ||
+            !_isShardBelowMaxMigrations(migrateCandidatesSelection->migrationsPerShard,
+                                        stat.shardId))
             continue;
 
-        auto status = isShardSuitableReceiver(stat, tag);
-        if (!status.isOK()) {
+        Status status = isShardSuitableReceiver(stat, tag);
+        if (!status.isOK())
             continue;
-        }
 
-        unsigned myChunks = distribution.numberOfChunksInShard(stat.shardId);
-        if (myChunks >= minChunks) {
+        const size_t shardChunkCount = distribution.numberOfChunksInShardWithTag(stat.shardId, tag);
+
+        if (shardChunkCount >= minChunks)
             continue;
-        }
+
 
         best = stat.shardId;
-        minChunks = myChunks;
+        minChunks = shardChunkCount;
     }
 
-    return best;
+    return std::make_pair(best, minChunks);
 }
 
-ShardId BalancerPolicy::_getMostOverloadedShard(const ShardStatisticsVector& shardStats,
-                                                const DistributionStatus& distribution,
-                                                const string& chunkTag,
-                                                const set<ShardId>& excludedShards) {
+std::pair<ShardId, size_t> BalancerPolicy::_getMostOverloadedDonorShard(
+    const ShardStatisticsVector& shardStats,
+    const DistributionStatus& distribution,
+    const std::string& tag,
+    MigrateCandidatesSelection* migrateCandidatesSelection,
+    const std::set<ShardId>& unusableDonorShards) {
     ShardId worst;
-    unsigned maxChunks = 0;
+    size_t maxChunks = 0;
 
     for (const auto& stat : shardStats) {
-        if (excludedShards.count(stat.shardId))
+        if (migrateCandidatesSelection->usedRecipientShards.count(stat.shardId) ||
+            !_isShardBelowMaxMigrations(migrateCandidatesSelection->migrationsPerShard,
+                                        stat.shardId) ||
+            unusableDonorShards.count(stat.shardId))
             continue;
 
-        const unsigned shardChunkCount =
-            distribution.numberOfChunksInShardWithTag(stat.shardId, chunkTag);
+        const size_t shardChunkCount = distribution.numberOfChunksInShardWithTag(stat.shardId, tag);
         if (shardChunkCount <= maxChunks)
             continue;
 
@@ -284,12 +333,13 @@ ShardId BalancerPolicy::_getMostOverloadedShard(const ShardStatisticsVector& sha
         maxChunks = shardChunkCount;
     }
 
-    return worst;
+    return std::make_pair(worst, maxChunks);
 }
 
-vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardStats,
-                                            const DistributionStatus& distribution,
-                                            std::set<ShardId>* usedShards) {
+vector<MigrateInfo> BalancerPolicy::balance(
+    const ShardStatisticsVector& shardStats,
+    DistributionStatus& distribution,
+    MigrateCandidatesSelection* migrateCandidatesSelection) {
     vector<MigrateInfo> migrations;
 
     // 1) Check for shards, which are in draining mode
@@ -298,42 +348,50 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
             if (!stat.isDraining)
                 continue;
 
-            if (usedShards->count(stat.shardId))
-                continue;
-
-            const vector<ChunkType>& chunks = distribution.getChunks(stat.shardId);
+            vector<ChunkType>& chunks = distribution.getChunks(stat.shardId);
 
             if (chunks.empty())
                 continue;
 
-            // Now we know we need to move to chunks off this shard, but only if permitted by the
+            // Now we know we need to move the chunks off this shard, but only if permitted by the
             // tags policy
-            unsigned numJumboChunks = 0;
+            auto chunkIter = chunks.begin();
+            size_t numMigrations = 0;
+            size_t numJumboChunks = 0;
 
             // Since we have to move all chunks, lets just do in order
-            for (const auto& chunk : chunks) {
+            while (chunkIter != chunks.end()) {
+                const auto& chunk = *chunkIter;
                 if (chunk.getJumbo()) {
                     numJumboChunks++;
+                    ++chunkIter;
                     continue;
                 }
-
                 const string tag = distribution.getTagForChunk(chunk);
-
-                const ShardId to =
-                    _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
+                const auto ShardNumChunksPair = _getLeastLoadedReceiverShard(
+                    shardStats, distribution, tag, migrateCandidatesSelection);
+                const ShardId to = ShardNumChunksPair.first;
                 if (!to.isValid()) {
                     if (migrations.empty()) {
                         warning() << "Chunk " << redact(chunk.toString())
                                   << " is on a draining shard, but no appropriate recipient found";
                     }
+                    ++chunkIter;
                     continue;
                 }
 
                 invariant(to != stat.shardId);
                 migrations.emplace_back(to, chunk);
-                invariant(usedShards->insert(stat.shardId).second);
-                invariant(usedShards->insert(to).second);
-                break;
+                migrateCandidatesSelection->usedDonorShards.insert(stat.shardId);
+                migrateCandidatesSelection->usedRecipientShards.insert(to);
+
+                chunkIter = distribution.moveChunkInDistributionAndUpdateMigrationsPerShard(
+                    stat.shardId, to, chunkIter, migrateCandidatesSelection);
+                ++numMigrations;
+
+                // No need to move other chunks on this shard
+                if (_maxMigrationsPerShard == numMigrations)
+                    break;
             }
 
             if (migrations.empty()) {
@@ -346,59 +404,77 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
     // 2) Check for chunks, which are on the wrong shard and must be moved off of it
     if (!distribution.tags().empty()) {
         for (const auto& stat : shardStats) {
-            if (usedShards->count(stat.shardId))
+            // If shard already has received something then move the chunks off it on the next round
+            // and also check if shard has exceeded numMigrationsPerShard.
+            if (migrateCandidatesSelection->usedRecipientShards.count(stat.shardId) ||
+                !_isShardBelowMaxMigrations(migrateCandidatesSelection->migrationsPerShard,
+                                            stat.shardId))
                 continue;
 
-            const vector<ChunkType>& chunks = distribution.getChunks(stat.shardId);
-
-            for (const auto& chunk : chunks) {
+            vector<ChunkType>& chunks = distribution.getChunks(stat.shardId);
+            auto it = chunks.begin();
+            size_t numMigrations = 0;
+            while (it != chunks.end()) {
+                const auto& chunk = *it;
                 const string tag = distribution.getTagForChunk(chunk);
 
-                if (tag.empty())
+                if (tag.empty() || stat.shardTags.count(tag)) {
+                    ++it;
                     continue;
-
-                if (stat.shardTags.count(tag))
-                    continue;
+                }
 
                 if (chunk.getJumbo()) {
                     warning() << "Chunk " << redact(chunk.toString()) << " violates zone "
                               << redact(tag) << ", but it is jumbo and cannot be moved";
+                    ++it;
                     continue;
                 }
-
-                const ShardId to =
-                    _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
+                // Chunks here are not on the right shard
+                const auto ShardNumChunksPair = _getLeastLoadedReceiverShard(
+                    shardStats, distribution, tag, migrateCandidatesSelection);
+                const ShardId to = ShardNumChunksPair.first;
                 if (!to.isValid()) {
                     if (migrations.empty()) {
                         warning() << "Chunk " << redact(chunk.toString()) << " violates zone "
                                   << redact(tag) << ", but no appropriate recipient found";
                     }
+                    ++it;
                     continue;
                 }
 
                 invariant(to != stat.shardId);
                 migrations.emplace_back(to, chunk);
-                invariant(usedShards->insert(stat.shardId).second);
-                invariant(usedShards->insert(to).second);
-                break;
+                migrateCandidatesSelection->usedDonorShards.insert(stat.shardId);
+                migrateCandidatesSelection->usedRecipientShards.insert(to);
+
+                it = distribution.moveChunkInDistributionAndUpdateMigrationsPerShard(
+                    stat.shardId, to, it, migrateCandidatesSelection);
+                ++numMigrations;
+                // No need to move other chunks
+                if (_maxMigrationsPerShard == numMigrations)
+                    break;
             }
         }
     }
 
-    // 3) for each tag balance
+    // 3) For each tag balance. Get the total # of chunks and shards with that tag, so that for
+    // each tag, the chunks are balanced on all the valid shards for that tag.
 
     vector<string> tagsPlusEmpty(distribution.tags().begin(), distribution.tags().end());
     tagsPlusEmpty.push_back("");
 
     for (const auto& tag : tagsPlusEmpty) {
         const size_t totalNumberOfChunksWithTag =
-            (tag.empty() ? distribution.totalChunks() : distribution.totalChunksWithTag(tag));
+            (tag.empty() ? distribution.totalChunksNotMaxedOut(shardStats)
+                         : distribution.totalChunksWithTagNotMaxedOut(shardStats, tag));
 
         size_t totalNumberOfShardsWithTag = 0;
 
         for (const auto& stat : shardStats) {
             if (tag.empty() || stat.shardTags.count(tag)) {
-                totalNumberOfShardsWithTag++;
+                Status status = isShardSuitableReceiver(stat, tag);
+                if (status.isOK())
+                    totalNumberOfShardsWithTag++;
             }
         }
 
@@ -417,13 +493,14 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
         // Calculate the rounded optimal number of chunks per shard
         const size_t idealNumberOfChunksPerShardForTag =
             (size_t)std::roundf(totalNumberOfChunksWithTag / (float)totalNumberOfShardsWithTag);
-
+        set<ShardId> unusableDonorShards;
         while (_singleZoneBalance(shardStats,
                                   distribution,
                                   tag,
                                   idealNumberOfChunksPerShardForTag,
                                   &migrations,
-                                  usedShards))
+                                  migrateCandidatesSelection,
+                                  &unusableDonorShards))
             ;
     }
 
@@ -435,9 +512,10 @@ boost::optional<MigrateInfo> BalancerPolicy::balanceSingleChunk(
     const ShardStatisticsVector& shardStats,
     const DistributionStatus& distribution) {
     const string tag = distribution.getTagForChunk(chunk);
-
-    ShardId newShardId =
-        _getLeastLoadedReceiverShard(shardStats, distribution, tag, set<ShardId>());
+    MigrateCandidatesSelection migrateCandidatesSelection;
+    const auto ShardNumChunksPair =
+        _getLeastLoadedReceiverShard(shardStats, distribution, tag, &migrateCandidatesSelection);
+    ShardId newShardId = ShardNumChunksPair.first;
     if (!newShardId.isValid() || newShardId == chunk.getShard()) {
         return boost::optional<MigrateInfo>();
     }
@@ -446,22 +524,28 @@ boost::optional<MigrateInfo> BalancerPolicy::balanceSingleChunk(
 }
 
 bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
-                                        const DistributionStatus& distribution,
-                                        const string& tag,
+                                        DistributionStatus& distribution,
+                                        const std::string& tag,
                                         size_t idealNumberOfChunksPerShardForTag,
-                                        vector<MigrateInfo>* migrations,
-                                        set<ShardId>* usedShards) {
-    const ShardId from = _getMostOverloadedShard(shardStats, distribution, tag, *usedShards);
+                                        std::vector<MigrateInfo>* migrations,
+                                        MigrateCandidatesSelection* migrateCandidatesSelection,
+                                        std::set<ShardId>* unusableDonorShards) {
+    size_t numMigrations = 0;
+    const auto shardNumChunksPair = _getMostOverloadedDonorShard(
+        shardStats, distribution, tag, migrateCandidatesSelection, *unusableDonorShards);
+    const auto from = shardNumChunksPair.first;
     if (!from.isValid())
         return false;
 
-    const size_t max = distribution.numberOfChunksInShardWithTag(from, tag);
+    size_t max = shardNumChunksPair.second;
 
     // Do not use a shard if it already has less entries than the optimal per-shard chunk count
     if (max <= idealNumberOfChunksPerShardForTag)
         return false;
 
-    const ShardId to = _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
+    const auto ShardNumChunksPair =
+        _getLeastLoadedReceiverShard(shardStats, distribution, tag, migrateCandidatesSelection);
+    const ShardId to = ShardNumChunksPair.first;
     if (!to.isValid()) {
         if (migrations->empty()) {
             log() << "No available shards to take chunks for zone [" << tag << "]";
@@ -469,51 +553,62 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
         return false;
     }
 
-    const size_t min = distribution.numberOfChunksInShardWithTag(to, tag);
+    size_t min = ShardNumChunksPair.second;
 
     // Do not use a shard if it already has more entries than the optimal per-shard chunk count
     if (min >= idealNumberOfChunksPerShardForTag)
         return false;
-
-    const size_t imbalance = max - idealNumberOfChunksPerShardForTag;
 
     LOG(1) << "collection : " << distribution.nss().ns();
     LOG(1) << "zone       : " << tag;
     LOG(1) << "donor      : " << from << " chunks on " << max;
     LOG(1) << "receiver   : " << to << " chunks on " << min;
     LOG(1) << "ideal      : " << idealNumberOfChunksPerShardForTag;
-    LOG(1) << "threshold  : " << kDefaultImbalanceThreshold;
 
-    // Check whether it is necessary to balance within this zone
-    if (imbalance < kDefaultImbalanceThreshold)
-        return false;
+    vector<ChunkType>& chunks = distribution.getChunks(from);
 
-    const vector<ChunkType>& chunks = distribution.getChunks(from);
+    size_t numJumboChunks = 0;
+    auto it = chunks.begin();
+    while (it != chunks.end()) {
+        if ((min >= idealNumberOfChunksPerShardForTag) ||
+            (max <= idealNumberOfChunksPerShardForTag))
+            break;
 
-    unsigned numJumboChunks = 0;
-
-    for (const auto& chunk : chunks) {
-        if (distribution.getTagForChunk(chunk) != tag)
-            continue;
-
-        if (chunk.getJumbo()) {
-            numJumboChunks++;
+        const auto& chunk = *it;
+        if (distribution.getTagForChunk(chunk) != tag) {
+            ++it;
             continue;
         }
 
+        if (chunk.getJumbo()) {
+            ++it;
+            numJumboChunks++;
+            continue;
+        }
+        invariant(to != from);
         migrations->emplace_back(to, chunk);
-        invariant(usedShards->insert(chunk.getShard()).second);
-        invariant(usedShards->insert(to).second);
-        return true;
+        migrateCandidatesSelection->usedDonorShards.insert(from);
+        migrateCandidatesSelection->usedRecipientShards.insert(to);
+        ++numMigrations;
+
+        it = distribution.moveChunkInDistributionAndUpdateMigrationsPerShard(
+            from, to, it, migrateCandidatesSelection);
+        if (_maxMigrationsPerShard == numMigrations)
+            break;
+
+        --max;
+        ++min;
     }
 
-    if (numJumboChunks) {
+    // Should not consider donor shard anymore if only jumbo chunks left in this zone.
+    if (numJumboChunks && numJumboChunks == distribution.numberOfChunksInShardWithTag(from, tag)) {
+        unusableDonorShards->insert(from);
         warning() << "Shard: " << from << ", collection: " << distribution.nss().ns()
                   << " has only jumbo chunks for zone \'" << tag
                   << "\' and cannot be balanced. Jumbo chunks count: " << numJumboChunks;
     }
 
-    return false;
+    return true;
 }
 
 ZoneRange::ZoneRange(const BSONObj& a_min, const BSONObj& a_max, const std::string& _zone)

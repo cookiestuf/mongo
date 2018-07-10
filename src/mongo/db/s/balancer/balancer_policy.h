@@ -66,13 +66,29 @@ struct MigrateInfo {
     ChunkVersion version;
 };
 
+/**
+ * This struct wraps the metadata needed for one round of balancing and reset after each round.
+ *
+ * usedDonorShards/usedRecipientShards contains the set of shards which have already been used for
+ * migrations. Used so we don't return conflicting migrations for the same shard.
+ *
+ * migrationsPerShard is a map that keeps track of the number of migrations a shard has participated
+ * in. This is to allow for concurrent migrations and ensure migrations do not exceed max migrations
+ * per shard.
+ */
+struct MigrateCandidatesSelection {
+    std::set<ShardId> usedDonorShards;
+    std::set<ShardId> usedRecipientShards;
+    std::map<ShardId, size_t> migrationsPerShard;
+};
 typedef std::vector<ClusterStatistics::ShardStatistics> ShardStatisticsVector;
 typedef std::map<ShardId, std::vector<ChunkType>> ShardToChunksMap;
 
 /**
  * This class constitutes a cache of the chunk distribution across the entire cluster along with the
  * zone boundaries imposed on it. This information is stored in format, which makes it efficient to
- * query utilization statististics and to decide what to balance.
+ * query utilization statistics. The balancer requires that this cache be changed as it determines
+ * what to balance.
  */
 class DistributionStatus {
     MONGO_DISALLOW_COPYING(DistributionStatus);
@@ -95,18 +111,32 @@ public:
     Status addRangeToZone(const ZoneRange& range);
 
     /**
-     * Returns total number of chunks across all shards.
+     * Moves the specified chunk from donorShard to receiverShard in the shardToChunksMap
+     * _shardChunks. Also increments the donor and receiver values in migrationsPerShard of
+     * migrateCandidatesSelection.
      */
-    size_t totalChunks() const;
+    std::vector<ChunkType>::iterator moveChunkInDistributionAndUpdateMigrationsPerShard(
+        const ShardId& donorShard,
+        const ShardId& receiverShard,
+        const std::vector<ChunkType>::iterator chunkIter,
+        MigrateCandidatesSelection* migrateCandidatesSelection);
+
+    /**
+     * Returns total number of chunks across all shards, excluding chunks on shards that are over
+     * maxSizeMB.
+     */
+    size_t totalChunksNotMaxedOut(const ShardStatisticsVector& shardStats) const;
 
     /**
      * Returns the total number of chunks across all shards, which fall into the specified zone's
-     * range.
+     * range, excluding chunks on shards that are over maxSizeMB.
      */
-    size_t totalChunksWithTag(const std::string& tag) const;
+    size_t totalChunksWithTagNotMaxedOut(const ShardStatisticsVector& shardStats,
+                                         const std::string& tag) const;
 
     /**
-     * Returns number of chunks in the specified shard.
+     * Returns number of chunks in the specified shard. This is used in the non-const methods in the
+     * class.
      */
     size_t numberOfChunksInShard(const ShardId& shardId) const;
 
@@ -116,9 +146,14 @@ public:
     size_t numberOfChunksInShardWithTag(const ShardId& shardId, const std::string& tag) const;
 
     /**
-     * Returns all chunks for the specified shard.
+     * Returns all chunks for the specified shard. This is used in the const methods in the class.
      */
     const std::vector<ChunkType>& getChunks(const ShardId& shardId) const;
+
+    /**
+     * Returns all chunks for the specified shard.
+     */
+    std::vector<ChunkType>& getChunks(const ShardId& shardId);
 
     /**
      * Returns all tag ranges defined for the collection.
@@ -171,7 +206,7 @@ public:
                                           const std::string& chunkTag);
 
     /**
-     * Returns a suggested set of chunks to move whithin a collection's shards, given the specified
+     * Returns a suggested set of chunks to move within a collection's shards, given the specified
      * state of the shards (draining, max size reached, etc) and the number of chunks for that
      * collection. If the policy doesn't recommend anything to move, it returns an empty vector. The
      * entries in the vector do are all for separate source/destination shards and as such do not
@@ -181,13 +216,12 @@ public:
      * any of the shards have chunks, which are sufficiently higher than this number, suggests
      * moving chunks to shards, which are under this number.
      *
-     * The usedShards parameter is in/out and it contains the set of shards, which have already been
-     * used for migrations. Used so we don't return multiple conflicting migrations for the same
-     * shard.
+     * The MigrateCandidateSelection parameter contains metadata for each round. See struct above
+     * for more information.
      */
     static std::vector<MigrateInfo> balance(const ShardStatisticsVector& shardStats,
-                                            const DistributionStatus& distribution,
-                                            std::set<ShardId>* usedShards);
+                                            DistributionStatus& distribution,
+                                            MigrateCandidatesSelection* migrateCandidatesSelection);
 
     /**
      * Using the specified distribution information, returns a suggested better location for the
@@ -202,38 +236,46 @@ private:
      * Return the shard with the specified tag, which has the least number of chunks. If the tag is
      * empty, considers all shards.
      */
-    static ShardId _getLeastLoadedReceiverShard(const ShardStatisticsVector& shardStats,
-                                                const DistributionStatus& distribution,
-                                                const std::string& tag,
-                                                const std::set<ShardId>& excludedShards);
+    static std::pair<ShardId, size_t> _getLeastLoadedReceiverShard(
+        const ShardStatisticsVector& shardStats,
+        const DistributionStatus& distribution,
+        const std::string& tag,
+        MigrateCandidatesSelection* migrateCandidatesSelection);
 
     /**
-     * Return the shard which has the least number of chunks with the specified tag. If the tag is
+     * Return the shard which has the most number of chunks with the specified tag. If the tag is
      * empty, considers all chunks.
      */
-    static ShardId _getMostOverloadedShard(const ShardStatisticsVector& shardStats,
-                                           const DistributionStatus& distribution,
-                                           const std::string& chunkTag,
-                                           const std::set<ShardId>& excludedShards);
+    static std::pair<ShardId, size_t> _getMostOverloadedDonorShard(
+        const ShardStatisticsVector& shardStats,
+        const DistributionStatus& distribution,
+        const std::string& tag,
+        MigrateCandidatesSelection* migrateCandidatesSelection,
+        const std::set<mongo::ShardId>& unusableDonorShards);
 
     /**
      * Selects one chunk for the specified zone (if appropriate) to be moved in order to bring the
      * deviation of the shards chunk contents closer to even across all shards in the specified
-     * zone. Takes into account and updates the shards, which have already been used for migrations.
+     * zone. Takes into account and updates the donorShards and recipientShard, which prevent a
+     * shard used as both a donor and recipient in one round.
      *
      * The 'idealNumberOfChunksPerShardForTag' indicates what is the ideal number of chunks which
      * each shard must have and is used to determine the imbalance and also to prevent chunks from
      * moving when not necessary.
      *
-     * Returns true if a migration was suggested, false otherwise. This method is intented to be
-     * called multiple times until all posible migrations for a zone have been selected.
+     * The 'unusableDonorShards' is for the case when a shard should move chunks off but only has
+     * jumbo chunks left for the specified zone. This parameter is reset after balancing each zone.
+     *
+     * Returns false once no more migrations are suggested. This method is intended to be
+     * called multiple times until all possible migrations for a zone have been selected.
      */
     static bool _singleZoneBalance(const ShardStatisticsVector& shardStats,
-                                   const DistributionStatus& distribution,
+                                   DistributionStatus& distribution,
                                    const std::string& tag,
                                    size_t idealNumberOfChunksPerShardForTag,
                                    std::vector<MigrateInfo>* migrations,
-                                   std::set<ShardId>* usedShards);
+                                   MigrateCandidatesSelection* migrateCandidatesSelection,
+                                   std::set<ShardId>* unusableDonorShards);
 };
 
 }  // namespace mongo

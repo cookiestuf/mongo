@@ -254,7 +254,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
     }
 
     MigrateInfoVector candidateChunks;
-    std::set<ShardId> usedShards;
+    MigrateCandidatesSelection migrateCandidatesSelection;
 
     std::shuffle(collections.begin(), collections.end(), _random);
 
@@ -271,7 +271,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
         }
 
         auto candidatesStatus =
-            _getMigrateCandidatesForCollection(opCtx, nss, shardStats, &usedShards);
+            _getMigrateCandidatesForCollection(opCtx, nss, shardStats, &migrateCandidatesSelection);
         if (candidatesStatus == ErrorCodes::NamespaceNotFound) {
             // Namespace got dropped before we managed to get to it, so just skip it
             continue;
@@ -413,7 +413,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
     OperationContext* opCtx,
     const NamespaceString& nss,
     const ShardStatisticsVector& shardStats,
-    std::set<ShardId>* usedShards) {
+    MigrateCandidatesSelection* migrateCandidatesSelection) {
     auto routingInfoStatus =
         Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss);
     if (!routingInfoStatus.isOK()) {
@@ -424,12 +424,12 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
 
     const auto& shardKeyPattern = cm->getShardKeyPattern().getKeyPattern();
 
-    const auto collInfoStatus = createCollectionDistributionStatus(opCtx, shardStats, cm);
+    auto collInfoStatus = createCollectionDistributionStatus(opCtx, shardStats, cm);
     if (!collInfoStatus.isOK()) {
         return collInfoStatus.getStatus();
     }
 
-    const DistributionStatus& distribution = collInfoStatus.getValue();
+    DistributionStatus& distribution = collInfoStatus.getValue();
 
     for (const auto& tagRangeEntry : distribution.tagRanges()) {
         const auto& tagRange = tagRangeEntry.second;
@@ -470,7 +470,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
         }
     }
 
-    return BalancerPolicy::balance(shardStats, distribution, usedShards);
+    return BalancerPolicy::balance(shardStats, distribution, migrateCandidatesSelection);
 }
 
 }  // namespace mongo
